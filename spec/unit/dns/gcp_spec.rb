@@ -74,102 +74,167 @@ EOT
     let(:hostname) { 'spicy-proton' }
     let(:zone) { MockDnsZone.new }
     let(:ip) { '169.254.255.255' }
+    let(:already_exists) { Google::Cloud::AlreadyExistsError.new('MockError') }
+    let(:precondition) { Google::Cloud::FailedPreconditionError.new('MockError') }
 
-    context 'when adding a record' do
-      before(:each) do
-        allow(Google::Cloud::Dns).to receive(:configure)
-        allow(Google::Cloud::Dns).to receive(:new).and_return(connection)
-        allow(connection).to receive(:zone).and_return(zone)
-        allow(subject).to receive(:get_ip).and_return(ip)
-      end
+    before(:each) do
+      allow(Google::Cloud::Dns).to receive(:configure)
+      allow(Google::Cloud::Dns).to receive(:new).and_return(connection)
+      allow(connection).to receive(:zone).and_return(zone)
+      allow(subject).to receive(:get_ip).and_return(ip)
+      allow(subject).to receive(:sleep)
+    end
 
-      it 'should attempt to add a record' do
-        expect(zone).to receive(:add).with(hostname, 'A', 60, ip)
-        result = subject.create_or_replace_record(hostname)
+    # Calls of #replace answer in turn: an exception is raised, anything else is returned.
+    def replace_answers(*answers)
+      calls = 0
+      allow(zone).to receive(:replace) do |*_args, **_opts|
+        answer = answers[[calls, answers.length - 1].min]
+        calls += 1
+        raise answer if answer.is_a?(Exception)
+
+        answer
       end
     end
 
-    context 'when record already exists' do
-      before(:each) do
-        allow(Google::Cloud::Dns).to receive(:configure)
-        allow(Google::Cloud::Dns).to receive(:new).and_return(connection)
-        allow(connection).to receive(:zone).and_return(zone)
-        allow(subject).to receive(:get_ip).and_return(ip)
-      end
+    it 'sets the record with one change that skips the SOA bump' do
+      expect(zone).to receive(:replace).with(hostname, 'A', 60, ip, skip_soa: true).once
+      subject.create_or_replace_record(hostname)
+    end
 
-      it 'should attempt to replace a record' do
-        allow(zone).to receive(:add).with(:hostname, 'A', 60, ip).and_raise(Google::Cloud::AlreadyExistsError,'MockError')
-        expect(zone).to receive(:replace).with(:hostname, 'A', 60, ip)
-        allow(subject).to receive(:get_ip).and_return(ip)
-        result = subject.create_or_replace_record(:hostname)
+    it 'never adds the record on its own, which fails when the record exists' do
+      allow(zone).to receive(:replace)
+      expect(zone).not_to receive(:add)
+      subject.create_or_replace_record(hostname)
+    end
+
+    it 'does nothing when the library finds nothing to change' do
+      replace_answers(nil)
+      expect { subject.create_or_replace_record(hostname) }.not_to raise_error
+    end
+
+    it 'does not try again when the change works' do
+      expect(zone).to receive(:replace).once
+      expect(subject).not_to receive(:sleep)
+      subject.create_or_replace_record(hostname)
+    end
+
+    context 'when the record appears after we looked' do
+      it 'tries again from a fresh read and succeeds' do
+        replace_answers(already_exists, nil)
+        expect(zone).to receive(:replace).twice
+        expect { subject.create_or_replace_record(hostname) }.not_to raise_error
       end
     end
 
-    context 'when add record fails' do
-      before(:each) do
-        allow(Google::Cloud::Dns).to receive(:configure)
-        allow(Google::Cloud::Dns).to receive(:new).and_return(connection)
-        allow(connection).to receive(:zone).and_return(zone)
-        allow(subject).to receive(:get_ip).and_return(ip)
+    context 'when another change to the zone wins the race' do
+      it 'tries again and succeeds' do
+        replace_answers(precondition, nil)
+        expect(zone).to receive(:replace).twice
+        expect { subject.create_or_replace_record(hostname) }.not_to raise_error
+      end
+    end
+
+    # The failure seen in production (P4DEVOPS-16408): AlreadyExistsError, then FailedPreconditionError while
+    # handling it, which escaped and failed the clone.
+    context 'when both errors happen one after the other' do
+      it 'carries on until the change works, and nothing escapes' do
+        replace_answers(already_exists, precondition, already_exists, nil)
+        expect(zone).to receive(:replace).exactly(4).times
+        expect { subject.create_or_replace_record(hostname) }.not_to raise_error
+      end
+    end
+
+    context 'when the change keeps failing' do
+      it 'gives up after MAX_ATTEMPTS and raises the last error, waiting between tries' do
+        replace_answers(precondition)
+        expect(zone).to receive(:replace).exactly(Vmpooler::PoolManager::Dns::Gcp::MAX_ATTEMPTS).times
+        expect(subject).to receive(:sleep).exactly(Vmpooler::PoolManager::Dns::Gcp::MAX_ATTEMPTS - 1).times
+        expect { subject.create_or_replace_record(hostname) }.to raise_error(Google::Cloud::FailedPreconditionError)
       end
 
-      it 'should retry' do
-        allow(zone).to receive(:add).with(:hostname, 'A', 60, ip).and_raise(Google::Cloud::FailedPreconditionError,'MockError')
-        expect(zone).to receive(:add).with(:hostname, 'A', 60, ip).exactly(30).times
-        allow(subject).to receive(:sleep)
-        result = subject.create_or_replace_record(:hostname)
+      it 'lets an error that is not a race through at once' do
+        replace_answers(Google::Cloud::PermissionDeniedError.new('MockError'))
+        expect(zone).to receive(:replace).once
+        expect(subject).not_to receive(:sleep)
+        expect { subject.create_or_replace_record(hostname) }.to raise_error(Google::Cloud::PermissionDeniedError)
       end
+    end
+
+    it 'counts and logs each retry upstream, so it can be seen' do
+      replace_answers(already_exists, precondition, nil)
+      allow(logger).to receive(:log) # the connection pool logs too
+      allow(metrics).to receive(:increment) # and counts connections
+      expect(metrics).to receive(:increment).with('dns.gcp.retry').twice
+      expect(logger).to receive(:log).with('[g]', /create_or_replace_record spicy-proton: Google::Cloud::AlreadyExistsError, attempt 1 of 5/)
+      expect(logger).to receive(:log).with('[g]', /Google::Cloud::FailedPreconditionError, attempt 2 of 5/)
+      subject.create_or_replace_record(hostname)
+    end
+
+    it 'waits longer after each failed attempt' do
+      replace_answers(precondition, precondition, nil)
+      waits = []
+      allow(subject).to receive(:sleep) { |seconds| waits << seconds }
+      subject.create_or_replace_record(hostname)
+      expect(waits.length).to eq(2)
+      expect(waits[0]).to be_between(1, 2)
+      expect(waits[1]).to be_between(2, 3)
     end
 
     context 'when IP does not exist' do
       let(:ip) { nil }
 
-      before(:each) do
-        allow(Google::Cloud::Dns).to receive(:configure)
-        allow(Google::Cloud::Dns).to receive(:new).and_return(connection)
-        allow(connection).to receive(:zone).and_return(zone)
-        allow(subject).to receive(:get_ip).and_return(ip)
-      end
-
-      it 'should not attempt to add a record' do
-        allow(zone).to receive(:add).with(:hostname, 'A', 60, ip).and_raise(Google::Cloud::AlreadyExistsError,'MockError')
-        expect(zone).to_not have_received(:add)
-        allow(subject).to receive(:get_ip).and_return(ip)
-        result = subject.create_or_replace_record(:hostname)
+      it 'should not attempt to change a record' do
+        expect(zone).not_to receive(:replace)
+        expect(zone).not_to receive(:add)
+        subject.create_or_replace_record(hostname)
       end
     end
   end
 
-  describe "#delete_record" do
+  describe '#delete_record' do
     let(:hostname) { 'spicy-proton' }
     let(:zone) { MockDnsZone.new }
+    let(:precondition) { Google::Cloud::FailedPreconditionError.new('MockError') }
 
-    context 'when removing a record' do
-      before(:each) do
-        allow(Google::Cloud::Dns).to receive(:configure)
-        allow(Google::Cloud::Dns).to receive(:new).and_return(connection)
-        allow(connection).to receive(:zone).and_return(zone)
+    before(:each) do
+      allow(Google::Cloud::Dns).to receive(:configure)
+      allow(Google::Cloud::Dns).to receive(:new).and_return(connection)
+      allow(connection).to receive(:zone).and_return(zone)
+      allow(subject).to receive(:sleep)
+    end
+
+    it 'removes the record with one change that skips the SOA bump' do
+      expect(zone).to receive(:remove).with(hostname, 'A', skip_soa: true).once
+      subject.delete_record(hostname)
+    end
+
+    it 'tries again when another change wins the race, and then works' do
+      calls = 0
+      allow(zone).to receive(:remove) do |*_args, **_opts|
+        calls += 1
+        raise precondition if calls == 1
       end
+      expect { subject.delete_record(hostname) }.not_to raise_error
+      expect(calls).to eq(2)
+    end
 
-      it 'should attempt to remove a record' do
-        expect(zone).to receive(:remove).with(:hostname, 'A')
-        result = subject.delete_record(:hostname)
+    context 'when the change keeps failing' do
+      it 'gives up after MAX_ATTEMPTS, logs it and does not raise' do
+        allow(zone).to receive(:remove).and_raise(precondition)
+        allow(logger).to receive(:log) # the connection pool and every retry log too
+        allow(metrics).to receive(:increment) # and the pool counts connections
+        expect(zone).to receive(:remove).exactly(Vmpooler::PoolManager::Dns::Gcp::MAX_ATTEMPTS).times
+        expect(metrics).to receive(:increment).with('dns.gcp.retry').exactly(Vmpooler::PoolManager::Dns::Gcp::MAX_ATTEMPTS - 1).times
+        expect(metrics).to receive(:increment).with('dns.gcp.delete_gave_up').once
+        expect(logger).to receive(:log).with('[g]', /delete_record spicy-proton gave up after 5 attempts/)
+        expect { subject.delete_record(hostname) }.not_to raise_error
       end
     end
 
-    context 'when removing a record fails' do
-      before(:each) do
-        allow(Google::Cloud::Dns).to receive(:configure)
-        allow(Google::Cloud::Dns).to receive(:new).and_return(connection)
-        allow(connection).to receive(:zone).and_return(zone)
-      end
-
-      it 'should retry' do
-        allow(zone).to receive(:remove).with(:hostname, 'A').and_raise(Google::Cloud::FailedPreconditionError,'MockError')
-        expect(zone).to receive(:remove).with(:hostname, 'A').exactly(30).times
-        allow(subject).to receive(:sleep)
-        result = subject.delete_record(:hostname)
-      end
+    it 'lets an error that is not a race through' do
+      allow(zone).to receive(:remove).and_raise(Google::Cloud::PermissionDeniedError.new('MockError'))
+      expect { subject.delete_record(hostname) }.to raise_error(Google::Cloud::PermissionDeniedError)
     end
   end
 
