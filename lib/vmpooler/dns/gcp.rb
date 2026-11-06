@@ -50,39 +50,54 @@ module Vmpooler
           dns_config['zone_name']
         end
 
+        # Cloud DNS applies the changes to a zone one at a time, and vmpooler runs several managers and many
+        # clones at once, so a change can lose a race. These errors mean "someone else changed the zone, or
+        # this record, a moment ago", and trying the change again from a fresh read settles them:
+        #   AlreadyExistsError      the record appeared after we looked, or an earlier try of this very change
+        #                           was applied although we never saw the answer
+        #   FailedPreconditionError a change that depends on state another change just replaced
+        RETRYABLE_ERRORS = [Google::Cloud::AlreadyExistsError, Google::Cloud::FailedPreconditionError].freeze
+        MAX_ATTEMPTS = 5
+        RETRY_DELAY_SECONDS = 1
+
+        # Make hostname resolve to the VM's IP address, whether or not a record for it exists already.
+        #
+        # One change replaces whatever A record the name has with the new one (a plain add when there is none),
+        # and does nothing when the record is already right. It is retried as a whole, reading the zone again,
+        # so a race with another change cannot raise from inside an error handler, which is how the earlier
+        # add-then-replace version let AlreadyExistsError and FailedPreconditionError escape and fail the clone
+        # (P4DEVOPS-16408).
+        #
+        # skip_soa: the client library otherwise adds a delete of the zone's SOA record and an add of the next
+        # serial to every change. That read-modify-write of one shared record is what makes concurrent changes
+        # fail their precondition. Cloud DNS raises the serial itself.
+        #
+        # Raises the last error when the change still fails after MAX_ATTEMPTS, so the clone fails visibly
+        # instead of leaving a VM without a record.
         def create_or_replace_record(hostname)
-          retries = 0
           ip = get_ip(hostname)
           if ip.nil?
             debug_logger("An IP Address was not recorded for #{hostname}")
-          else
-            begin
-              change = connection.zone(zone_name).add(hostname, 'A', 60, ip)
-              debug_logger("#{change.id} - #{change.started_at} - #{change.status} DNS address added") if change
-            rescue Google::Cloud::AlreadyExistsError => _e
-              # the error is Google::Cloud::AlreadyExistsError: alreadyExists: The resource 'entity.change.additions[0]' named 'instance-8.test.vmpooler.net. (A)' already exists
-              # the error is Google::Cloud::AlreadyExistsError: alreadyExists: The resource 'entity.change.additions[0]' named 'instance-8.test.vmpooler.net. (A)' already exists
-              change = connection.zone(zone_name).replace(hostname, 'A', 60, ip)
-              debug_logger("#{change.id} - #{change.started_at} - #{change.status} DNS address previously existed and was replaced") if change
-            rescue Google::Cloud::FailedPreconditionError => e
-              debug_logger("DNS create failed, retrying error: #{e}")
-              sleep 5
-              retry if (retries += 1) < 30
-            end
+            return
+          end
+
+          with_dns_retries("create_or_replace_record #{hostname}") do
+            change = connection.zone(zone_name).replace(hostname, 'A', 60, ip, skip_soa: true)
+            debug_logger("#{change.id} - #{change.started_at} - #{change.status} DNS address set") if change
           end
         end
 
+        # Remove the A record for hostname. Nothing to do when there is none. A change that keeps failing is
+        # logged and given up on, not raised: the VM is already gone and a leftover record is harmless, where
+        # raising would make vmpooler treat the destroy as failed.
         def delete_record(hostname)
-          retries = 0
-          begin
-            connection.zone(zone_name).remove(hostname, 'A')
-          rescue Google::Cloud::FailedPreconditionError => e
-            # this error was experienced intermittently, will retry to see if it can complete successfully
-            # the error is Google::Cloud::FailedPreconditionError: conditionNotMet: Precondition not met for 'entity.change.deletions[1]'
-            debug_logger("GCP DNS delete_record failed, retrying error: #{e}")
-            sleep 5
-            retry if (retries += 1) < 30
+          with_dns_retries("delete_record #{hostname}") do
+            connection.zone(zone_name).remove(hostname, 'A', skip_soa: true)
           end
+        rescue *RETRYABLE_ERRORS => e
+          debug_logger("GCP DNS delete_record #{hostname} gave up after #{MAX_ATTEMPTS} attempts: #{e.class}: #{e.message}", send_to_upstream: true)
+          metrics.increment('dns.gcp.delete_gave_up')
+          nil
         end
 
         def connection
@@ -122,6 +137,24 @@ module Vmpooler
 
             sleep(try * retry_factor)
             try += 1
+            retry
+          end
+        end
+
+        # Run the block, and run it again from the start while it fails with one of RETRYABLE_ERRORS, up to
+        # MAX_ATTEMPTS times in all. The wait grows with each attempt and has some randomness, so managers
+        # that collided do not collide again. Every retry is logged upstream and counted, so it can be seen.
+        def with_dns_retries(operation)
+          attempt = 0
+          begin
+            attempt += 1
+            yield
+          rescue *RETRYABLE_ERRORS => e
+            raise if attempt >= MAX_ATTEMPTS
+
+            metrics.increment('dns.gcp.retry')
+            debug_logger("#{operation}: #{e.class}, attempt #{attempt} of #{MAX_ATTEMPTS}, trying again", send_to_upstream: true)
+            sleep(attempt * RETRY_DELAY_SECONDS + rand)
             retry
           end
         end
